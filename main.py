@@ -8,7 +8,8 @@ import torch.nn as nn
 import data
 import model
 
-from utils import batchify, get_batch, repackage_hidden
+
+from utils import batchify, get_batch, repackage_hidden, openai_compute, non_emb_param_count
 
 parser = argparse.ArgumentParser(description='PyTorch PennTreeBank RNN/LSTM Language Model')
 parser.add_argument('--data', type=str, default='data/penn/',
@@ -49,6 +50,8 @@ parser.add_argument('--cuda', action='store_false',
                     help='use CUDA')
 parser.add_argument('--log-interval', type=int, default=200, metavar='N',
                     help='report interval')
+parser.add_argument('--val-log-interval', type=int, default=8000, metavar='VN',
+                    help='val report interval')
 randomhash = ''.join(str(time.time()).split('.'))
 parser.add_argument('--save', type=str,  default=randomhash+'.pt',
                     help='path to save the final model')
@@ -64,8 +67,31 @@ parser.add_argument('--optimizer', type=str,  default='sgd',
                     help='optimizer to use (sgd, adam)')
 parser.add_argument('--when', nargs="+", type=int, default=[-1],
                     help='When (which epochs) to divide the learning rate by 10 - accepts multiple')
+
+parser.add_argument('--wandb', type=str, default=None,
+                    help='Use weights and biases logging.')
+parser.add_argument('--knockknock', action="store_true",
+                    help='Use knockknock alerts')
+
 args = parser.parse_args()
 args.tied = True
+
+if args.knockknock:
+    from knockknock import slack_sender
+    webhook_url = open("slack_webhook.txt").read()
+if args.wandb:
+    import wandb
+    logged_params = {"dataset": "wt103",
+                     "sequence_length": args.bptt,
+                     "memory_length": None,
+                     "n_embd": args.emsize,
+                     "d_inner": None,
+                     "n_layer": args.nlayers,
+                     "n_head": args.nhid,
+                     "dropout": args.dropout,
+                     "codebase": "AWD-LSTM"
+                     }
+    wandb.init(project=args.wandb, config=logged_params)
 
 # Set the random seed manually for reproducibility.
 np.random.seed(args.seed)
@@ -168,7 +194,7 @@ def evaluate(data_source, batch_size=10):
     return total_loss.item() / len(data_source)
 
 
-def train():
+def epoch_loop(epoch):
     # Turn on training mode which enables dropout.
     if args.model == 'QRNN': model.reset()
     total_loss = 0
@@ -206,6 +232,8 @@ def train():
         # `clip_grad_norm` helps prevent the exploding gradient problem in RNNs / LSTMs.
         if args.clip: torch.nn.utils.clip_grad_norm_(params, args.clip)
         optimizer.step()
+        model.training_steps += 1
+        model.compute += openai_compute(non_emb_param_count(model, ntokens), data.numel(), 1)
 
         total_loss += raw_loss.data
         optimizer.param_groups[0]['lr'] = lr2
@@ -216,84 +244,122 @@ def train():
                     'loss {:5.2f} | ppl {:8.2f} | bpc {:8.3f}'.format(
                 epoch, batch, len(train_data) // args.bptt, optimizer.param_groups[0]['lr'],
                 elapsed * 1000 / args.log_interval, cur_loss, math.exp(cur_loss), cur_loss / math.log(2)))
+            if args.wandb:
+                wandb.log({"train_loss": cur_loss, "learning rate": optimizer.param_groups[0]['lr'],
+                           "global_step": model.compute},
+                          step=model.training_steps)
+            total_loss = 0
+            start_time = time.time()
+
+        if model.training_steps % args.val_log_interval == 0 and model.training_steps > 0:
+            val_loss = evaluate(val_data)
+            elapsed = time.time() - start_time
+            print('-' * 89)
+            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:05.5f} | ms/batch {:5.2f} | '
+                    'val loss {:5.2f} | ppl {:8.2f} | bpc {:8.3f}'.format(
+                epoch, batch, len(train_data) // args.bptt, optimizer.param_groups[0]['lr'],
+                elapsed * 1000 / args.log_interval, val_loss, math.exp(val_loss), val_loss / math.log(2)))
+            print('-' * 89)
+            if args.wandb:
+                wandb.log({"valid_loss": val_loss, "global_step": model.compute}, step=model.training_steps)
             total_loss = 0
             start_time = time.time()
         ###
         batch += 1
         i += seq_len
 
-# Loop over epochs.
-lr = args.lr
-best_val_loss = []
-stored_loss = 100000000
 
 # At any point you can hit Ctrl + C to break out of training early.
-try:
-    optimizer = None
-    # Ensure the optimizer is optimizing params, which includes both the model's weights as well as the criterion's weight (i.e. Adaptive Softmax)
-    if args.optimizer == 'sgd':
-        optimizer = torch.optim.SGD(params, lr=args.lr, weight_decay=args.wdecay)
-    if args.optimizer == 'adam':
-        optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.wdecay)
-    for epoch in range(1, args.epochs+1):
-        epoch_start_time = time.time()
-        train()
-        if 't0' in optimizer.param_groups[0]:
-            tmp = {}
-            for prm in model.parameters():
-                tmp[prm] = prm.data.clone()
-                prm.data = optimizer.state[prm]['ax'].clone()
+def conditional_slack_sender(condition):
 
-            val_loss2 = evaluate(val_data)
-            print('-' * 89)
-            print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
-                'valid ppl {:8.2f} | valid bpc {:8.3f}'.format(
-                    epoch, (time.time() - epoch_start_time), val_loss2, math.exp(val_loss2), val_loss2 / math.log(2)))
-            print('-' * 89)
-
-            if val_loss2 < stored_loss:
-                model_save(args.save)
-                print('Saving Averaged!')
-                stored_loss = val_loss2
-
-            for prm in model.parameters():
-                prm.data = tmp[prm].clone()
-
+    def conditioned(func):
+        if condition:
+            return slack_sender(webhook_url=webhook_url, channel="Teven")(func)
         else:
-            val_loss = evaluate(val_data, eval_batch_size)
-            print('-' * 89)
-            print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
-                'valid ppl {:8.2f} | valid bpc {:8.3f}'.format(
-              epoch, (time.time() - epoch_start_time), val_loss, math.exp(val_loss), val_loss / math.log(2)))
-            print('-' * 89)
+            return func
 
-            if val_loss < stored_loss:
-                model_save(args.save)
-                print('Saving model (new best validation)')
-                stored_loss = val_loss
+    return conditioned
 
-            if args.optimizer == 'sgd' and 't0' not in optimizer.param_groups[0] and (len(best_val_loss)>args.nonmono and val_loss > min(best_val_loss[:-args.nonmono])):
-                print('Switching to ASGD')
-                optimizer = torch.optim.ASGD(model.parameters(), lr=args.lr, t0=0, lambd=0., weight_decay=args.wdecay)
 
-            if epoch in args.when:
-                print('Saving model before learning rate decreased')
-                model_save('{}.e{}'.format(args.save, epoch))
-                print('Dividing learning rate by 10')
-                optimizer.param_groups[0]['lr'] /= 10.
+@conditional_slack_sender(args.knockknock)
+def train():
+    # Loop over epochs.
+    best_val_loss = []
+    stored_loss = 100000000
 
-            best_val_loss.append(val_loss)
+    try:
+        optimizer = None
+        # Ensure the optimizer is optimizing params, which includes both the model's weights as well as the criterion's weight (i.e. Adaptive Softmax)
+        if args.optimizer == 'sgd':
+            optimizer = torch.optim.SGD(params, lr=args.lr, weight_decay=args.wdecay)
+        if args.optimizer == 'adam':
+            optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.wdecay)
+        for epoch in range(1, args.epochs+1):
+            epoch_start_time = time.time()
+            epoch_loop(epoch)
+            if 't0' in optimizer.param_groups[0]:
+                tmp = {}
+                for prm in model.parameters():
+                    tmp[prm] = prm.data.clone()
+                    prm.data = optimizer.state[prm]['ax'].clone()
 
-except KeyboardInterrupt:
-    print('-' * 89)
-    print('Exiting from training early')
+                val_loss2 = evaluate(val_data)
+                print('-' * 89)
+                print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
+                    'valid ppl {:8.2f} | valid bpc {:8.3f}'.format(
+                        epoch, (time.time() - epoch_start_time), val_loss2, math.exp(val_loss2), val_loss2 / math.log(2)))
+                print('-' * 89)
 
-# Load the best saved model.
-model_load(args.save)
+                if val_loss2 < stored_loss:
+                    model_save(args.save)
+                    print('Saving Averaged!')
+                    stored_loss = val_loss2
 
-# Run on test data.
-test_loss = evaluate(test_data, test_batch_size)
-print('=' * 89)
-print('| End of training | test loss {:5.2f} | test ppl {:8.2f} | test bpc {:8.3f}'.format(
-    test_loss, math.exp(test_loss), test_loss / math.log(2)))
-print('=' * 89)
+                for prm in model.parameters():
+                    prm.data = tmp[prm].clone()
+
+            else:
+                val_loss = evaluate(val_data, eval_batch_size)
+                print('-' * 89)
+                print('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
+                    'valid ppl {:8.2f} | valid bpc {:8.3f}'.format(
+                  epoch, (time.time() - epoch_start_time), val_loss, math.exp(val_loss), val_loss / math.log(2)))
+                print('-' * 89)
+
+                if val_loss < stored_loss:
+                    model_save(args.save)
+                    print('Saving model (new best validation)')
+                    stored_loss = val_loss
+
+                if args.optimizer == 'sgd' and 't0' not in optimizer.param_groups[0] and (len(best_val_loss)>args.nonmono and val_loss > min(best_val_loss[:-args.nonmono])):
+                    print('Switching to ASGD')
+                    optimizer = torch.optim.ASGD(model.parameters(), lr=args.lr, t0=0, lambd=0., weight_decay=args.wdecay)
+
+                if epoch in args.when:
+                    print('Saving model before learning rate decreased')
+                    model_save('{}.e{}'.format(args.save, epoch))
+                    print('Dividing learning rate by 10')
+                    optimizer.param_groups[0]['lr'] /= 10.
+
+                best_val_loss.append(val_loss)
+            return min(best_val_loss[:-args.nonmono])
+
+    except KeyboardInterrupt:
+        print('-' * 89)
+        print('Exiting from training early')
+
+
+if __name__ == "__main__":
+
+    train()
+
+    # Load the best saved model.
+    model_load(args.save)
+
+    # Run on test data.
+    test_loss = evaluate(test_data, test_batch_size)
+    print('=' * 89)
+    print('| End of training | test loss {:5.2f} | test ppl {:8.2f} | test bpc {:8.3f}'.format(
+        test_loss, math.exp(test_loss), test_loss / math.log(2)))
+    print('=' * 89)
+    wandb.log({"test_loss": test_loss, "global_step": model.compute})
