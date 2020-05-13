@@ -174,6 +174,13 @@ params = list(model.parameters()) + list(criterion.parameters())
 total_params = sum(x.size()[0] * x.size()[1] if len(x.size()) > 1 else x.size()[0] for x in params if x.size())
 print('Args:', args)
 print('Model total parameters:', total_params)
+print('Non embedding parameters:', non_emb_param_count(model, ntokens))
+optimizer = None
+# Ensure the optimizer is optimizing params, which includes both the model's weights as well as the criterion's weight (i.e. Adaptive Softmax)
+if args.optimizer == 'sgd':
+    optimizer = torch.optim.SGD(params, lr=args.lr, weight_decay=args.wdecay)
+if args.optimizer == 'adam':
+    optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.wdecay)
 
 ###############################################################################
 # Training code
@@ -288,12 +295,6 @@ def train():
     stored_loss = 100000000
 
     try:
-        optimizer = None
-        # Ensure the optimizer is optimizing params, which includes both the model's weights as well as the criterion's weight (i.e. Adaptive Softmax)
-        if args.optimizer == 'sgd':
-            optimizer = torch.optim.SGD(params, lr=args.lr, weight_decay=args.wdecay)
-        if args.optimizer == 'adam':
-            optimizer = torch.optim.Adam(params, lr=args.lr, weight_decay=args.wdecay)
         for epoch in range(1, args.epochs+1):
             epoch_start_time = time.time()
             epoch_loop(epoch)
